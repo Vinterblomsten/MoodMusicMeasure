@@ -1,0 +1,884 @@
+---
+title: "MoodMusicMeasure"
+output: html_document
+date: "2025-12-19"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(rstatix)
+library(lmerTest)
+library(brms)
+library(ggdist)
+library(tidybayes)
+library(hBayesDM)
+library(BayesFactor)
+library(bayestestR)
+```
+
+Import Data
+```{r}
+files <- list.files(pattern = "results.csv", recursive = TRUE)
+
+df <- do.call(rbind, lapply(files, read.csv))
+data <- df %>%
+  filter(Blocktype != "Practice") %>%
+  mutate(
+    InductionMusicScore = as.numeric(InductionMusicScore),
+    PostMoodScore = as.numeric(PostMoodScore),
+    PreMoodScore = as.numeric(PreMoodScore)
+  )
+```
+
+Empty data check
+```{r}
+missingCol <- colSums(is.na(df))
+print(missingCol)
+```
+
+Data type check
+```{r}
+str(data)
+```
+
+Exclusion of the found participants
+```{r}
+ex_data <- data %>%
+  filter(!( FID %in% c("03T", "04T","105c","210a", "203a"))) %>%
+  extract(Blocktype,
+          into = c("Arousal", "Valence"),
+          regex = "(H|L)a(H|L)v",
+          remove = FALSE) %>%
+  mutate(
+    Arousal = ifelse(Blocktype=="ctrl", "C", Arousal),
+    Valence = ifelse(Blocktype=="ctrl", "C", Valence)
+  )
+```
+
+
+Adding ProportionIdeal
+```{r}
+ex_data <- ex_data %>% 
+  mutate(
+    Ideal = ifelse((Arm == 'A'), 1, 0)
+  ) %>%
+  group_by(FID, Blocktype, Block) %>%
+  mutate(
+    NumIdeal = cumsum(Ideal),
+    NumNonIdeal = cumsum(!Ideal),
+    ProportionIdeal = ifelse(NumNonIdeal == 0, 1, NumIdeal / (NumNonIdeal+NumIdeal))
+  )
+```
+
+
+Test for random svar:
+```{r}
+ex_data %>%
+  filter(Block == "1", Trial == 50) %>%
+  pull(ProportionIdeal) %>%
+  ttestBF(., mu=0.5)
+
+ex_data %>%
+  filter(Block == "2", Trial == 50) %>%
+  pull(ProportionIdeal) %>%
+  ttestBF(., mu=0.5)
+```
+
+MoodScore Plot
+```{r}
+ex_data %>%
+  filter(Trial == 50, Block == 1) %>%
+  group_by(Blocktype) %>%
+  summarise(
+    meanPoMS = mean(PostMoodScore),
+    meanPrMS = mean(PreMoodScore),
+    meanIMS = mean(InductionMusicScore),
+  ) %>%
+  pivot_longer(
+    cols = starts_with("mean"),
+    names_to = "Measure",
+    values_to = "Mean"
+  ) %>%
+  ggplot(aes(
+    x = Blocktype, 
+    y = Mean, 
+    fill = Measure
+    )) +
+    geom_col(position = position_dodge()) +
+  labs(
+    title = "Mean Scores by Blocktype",
+    x = "Blocktype",
+    y = "Mean Score"
+  ) +
+  theme_minimal()
+ 
+```
+
+Linear mixed model for factors of induction on PostMoodScore
+```{r}
+
+moodInfluence <- ex_data %>%
+  extract(Blocktype,
+          into = c("Arousal", "Valence"),
+          regex = "(H|L)a(H|L)v",
+          remove = FALSE) %>%
+  filter(Trial == 50, Block == 1) %>%
+  brm(PostMoodScore ~ Arousal * Valence + (1|FID), data=., cores=4)
+```
+
+
+Correlation between InductionMusicScore and PostMoodScore
+```{r}
+moodMusicCor <- ex_data %>%
+  filter(Trial == 50, Block == 1) %>%
+  brm(PostMoodScore ~ InductionMusicScore, data=., cores=4)
+
+ex_data %>%
+  filter(Trial == 50, Block == 1) %>%
+  regressionBF(PostMoodScore ~ InductionMusicScore, data = .)
+
+moodMusicCor %>% summary()
+```
+
+LMM for InductionMusicScore
+```{r}
+preferenceModel <- ex_data %>%
+  extract(Blocktype,
+          into = c("Arousal", "Valence"),
+          regex = "(H|L)a(H|L)v",
+          remove = FALSE) %>%
+  filter(Trial == 50, Block == 1) %>%
+  brm(InductionMusicScore ~ Blocktype + (1|FID), data=., cores=4)
+
+preferenceModel %>% summary()
+```
+
+
+Test om akkumuleret score
+
+```{r}
+ex_data %>%
+  filter(Block == "1", Trial == 50) %>%
+  brm(Acummulated ~ Blocktype + (1|FID), data=., cores = 4) %>%
+  summary()
+```
+
+Visualizing per condition
+```{r}
+ex_data %>%
+  filter(Block == "1", !( FID %in% c("03T", "04T","105c","210a", "203a"))) %>%
+  group_by(Trial, Blocktype) %>%
+  summarise(
+    meanIdeal = mean(ProportionIdeal, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  ggplot(aes(x = Trial, y = meanIdeal, color = Blocktype, group = Blocktype)) +
+  geom_line() +
+  geom_point()
+```
+
+Same
+```{r}
+ex_data %>%
+  filter(Block == "1",
+         !(FID %in% c("03T", "04T","105c","210a", "203a")),
+         !(Trial %in% c(1,2,3,4,5))) %>%
+  group_by(Trial, Arousal, Valence) %>%
+  summarise(
+    meanIdeal = mean(ProportionIdeal, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  ggplot(aes(
+    x = Trial,
+    y = meanIdeal,
+    color = interaction(Arousal, Valence),   # ← 4-line grouping
+    group = interaction(Arousal, Valence)
+  )) +
+  geom_line() +
+  geom_point() +
+  labs(color = "Arousal × Valence")
+```
+
+
+Per trial testing for learning BF and visualization
+```{r}
+safeBF <- function(x, mu = 0.5) {
+  if(length(x) < 2 || sd(x) == 0) return(NA)
+  bf <- ttestBF(x, mu = mu, nullInterval = c(0, Inf))
+  bf_val <- extractBF(bf, onlybf = TRUE)
+  bf_val[1]   # ensure single number
+}
+
+betterThanChance <- ex_data %>% 
+  filter(Block=="1") %>%
+  group_by(Trial, Valence) %>% 
+  summarise( 
+    PropIdeal = mean(ProportionIdeal), 
+    PropIdealSD = sd(ProportionIdeal), 
+    BF = safeBF(ProportionIdeal, mu = 0.5), 
+    N = n(), 
+  )
+
+
+betterThanChance %>%
+  select(
+    Trial, Valence, BF
+  ) %>% 
+  filter(BF > 10)
+
+
+# Plot BF per trial with logarithmic y-axis
+ggplot(betterThanChance, aes(x = Trial, y = BF, color = Valence)) +
+  geom_line(size = 1.2) +
+  geom_hline(yintercept = 10, linetype = "dashed", color = "red") +
+  geom_vline(xintercept = 19, linetype = "solid", color = "black") +
+  scale_y_log10() +
+  labs(
+    title = "Bayes Factor (ProportionIdeal > 0.5) Across Trials",
+    x = "Trial",
+    y = "BF10 (log scale)",
+    color = "Valence"
+  ) +
+  theme_minimal() +
+  theme(
+    text = element_text(size = 14),
+    legend.position = "top"
+  )
+
+ttestBF(
+  ex_data %>% filter(Trial >= 21, Valence == "L", Block == "1") %>% pull(ProportionIdeal),
+  ex_data %>% filter(Trial >= 21, Valence == "H", Block == "1") %>% pull(ProportionIdeal),
+  paired = TRUE
+) 
+
+
+```
+
+Visualization of ProportionIdeal for arousal
+```{r}
+ex_data %>%
+  filter(Blocktype != "ctrl", Block == "1", !(Trial %in% c(1,2,3))) %>%
+  group_by(Trial, Arousal) %>%
+  summarise(
+    meanProp = mean(ProportionIdeal)
+  ) %>%
+  ggplot(aes(
+    x = Trial,
+    y = meanProp,
+    colour = Arousal
+  )) +
+  geom_point() +
+  geom_smooth()
+```
+
+
+Test på Trial niveau af ProportionIdeal
+```{r}
+safeBF <- function(x, mu = 0.5) {
+  if(length(x) < 2 || sd(x) == 0) return(NA)
+  bf <- ttestBF(x, mu = mu, nullInterval = c(0, Inf))
+  bf_val <- extractBF(bf, onlybf = TRUE)
+  bf_val[1]   # ensure single number
+}
+
+betterThanChance <- ex_data %>% 
+  filter(Block=="1") %>%
+  group_by(Trial, Arousal) %>% 
+  summarise( 
+    PropIdeal = mean(ProportionIdeal), 
+    PropIdealSD = sd(ProportionIdeal), 
+    BF = safeBF(ProportionIdeal, mu = 0.5), 
+    N = n(), 
+  )
+
+
+betterThanChance %>%
+  select(
+    Trial, Arousal, BF
+  ) %>% 
+  filter(Arousal == "H", BF > 10)
+
+ggplot(betterThanChance, aes(x = Trial, y = BF, color = Arousal)) +
+  geom_line(size = 1.2) +
+  geom_hline(yintercept = 10, linetype = "dashed", color = "red") +
+  geom_vline(xintercept = 19, linetype = "solid", color = "black") +
+  scale_y_log10() +
+  labs(
+    title = "Bayes Factor (ProportionIdeal > 0.5) Across Trials",
+    x = "Trial",
+    y = "BF10 (log scale)",
+    color = "Arousal"
+  ) +
+  theme_minimal() +
+  theme(
+    text = element_text(size = 14),
+    legend.position = "top"
+  )
+
+
+```
+
+
+Test of ProportionIdeal from 19 and 21 respectively
+```{r}
+ex_data %>%
+  filter(!(Trial %in% c(1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18)), Blocktype != "ctrl", Block == "1") %>%
+  brm(ProportionIdeal ~ Arousal + Valence + (1|FID), data=., cores=4) %>%
+  summary()
+
+ttestBF(
+  ex_data %>% filter(Trial >= 19, Arousal == "L", Block == "1") %>% pull(ProportionIdeal),
+  ex_data %>% filter(Trial >= 19, Arousal == "H", Block == "1") %>% pull(ProportionIdeal),
+  paired = TRUE
+) 
+
+ttestBF(
+  ex_data %>% filter(Trial >= 21, Valence == "L", Block == "1") %>% pull(ProportionIdeal),
+  ex_data %>% filter(Trial >= 21, Valence == "H", Block == "1") %>% pull(ProportionIdeal),
+  paired = TRUE
+) 
+```
+
+
+Check for block 2 på trial niveau
+```{r}
+betterThanChance <- ex_data %>% 
+  filter(Block=="2") %>%
+  group_by(Trial, Valence) %>% 
+  summarise( 
+    PropIdeal = mean(ProportionIdeal), 
+    PropIdealSD = sd(ProportionIdeal), 
+    BF = safeBF(ProportionIdeal, mu = 0.5), 
+    N = n(), 
+  )
+
+betterThanChance %>%
+  select(
+    Trial, Arousal, BF
+  ) %>% 
+  filter(BF > 10)
+
+
+betterThanChance %>%
+  select(
+    Trial, Valence, BF
+  ) %>% 
+  filter(BF > 10)
+
+ggplot(betterThanChance, aes(x = Trial, y = BF, color = Valence)) +
+  geom_line(size = 1.2) +
+  geom_hline(yintercept = 10, linetype = "dashed", color = "red") +
+  geom_vline(xintercept = 19, linetype = "solid", color = "black") +
+  scale_y_log10() +
+  labs(
+    title = "Bayes Factor (ProportionIdeal > 0.5) Across Trials",
+    x = "Trial",
+    y = "BF10 (log scale)",
+    color = "Arousal"
+  ) +
+  theme_minimal() +
+  theme(
+    text = element_text(size = 14),
+    legend.position = "top"
+  )
+
+```
+
+
+Switchrate against BLocktype
+```{r}
+switchRateMod <- ex_data %>%
+  filter(Trial == 50) %>%
+  brm(SwitchRate ~ Blocktype + (1|FID), data=., cores = 4)
+
+ttestBF(ex_data%>%filter(Arousal=="H", Trial==50)%>%pull(SwitchRate), ex_data%>%filter(Arousal=="L", Trial==50)%>%pull(SwitchRate), paired=FALSE)
+  
+
+summary(switchRateMod)
+```
+
+
+
+RL-Model
+```{r}
+library(cmdstanr)
+library(dplyr)
+library(posterior)
+
+
+df <- ex_data %>%
+  ungroup() %>%
+  mutate(
+    subject = FID,
+    condition = as.integer(case_when(
+      Blocktype == "ctrl"  ~ 1,
+      Blocktype == "HaHv"  ~ 2,
+      Blocktype == "HaLv"  ~ 3,
+      Blocktype == "LaHv"  ~ 4,
+      Blocktype == "LaLv"  ~ 5
+    )),
+    block = as.integer(Block),
+    trial = as.integer(Trial),
+    choice = as.integer(ifelse(Arm=="A", 1, 2)),
+    reward = as.integer(ifelse(Reward==0, 0, 1))
+  ) %>%
+  select(
+    subject, condition, block, trial, choice, reward
+  )
+
+df$subject <- match(df$subject, unique(df$subject))
+
+# context index: e.g. ctx = (condition-1)*blocks + block  -> 1..(conds*blocks)
+df <- df %>%
+  mutate(
+    ctx = (condition - 1) * 2 + block
+  )
+
+# reset = 1 for first trial of each block per subject
+df <- df %>%
+  group_by(subject, condition, block) %>%
+  arrange(trial) %>%
+  mutate(reset = if_else(row_number() == 1, 1L, 0L)) %>%
+  ungroup()
+
+df <- df %>% arrange(subject, condition, block, trial)
+T <- nrow(df)
+S <- length(unique(df$subject))
+K <- length(unique(df$ctx))
+
+stan_data <- list(
+  S = S,
+  T = T,
+  K = K,
+  subj = as.integer(df$subject),
+  ctx  = as.integer(df$ctx),
+  choice = as.integer(df$choice),
+  reward = as.integer(df$reward),
+  reset = as.integer(df$reset)
+)
+
+
+mod_file <- "stanModel.stan"  
+mod <- cmdstan_model(mod_file)
+
+fit <- mod$sample(
+  data = stan_data,
+  chains = 4,
+  parallel_chains = 4,
+  iter_warmup = 1000,
+  iter_sampling = 1000,
+  max_treedepth = 14,
+  adapt_delta = 0.9
+)
+
+print(fit$summary(c("mu_a","sigma_a","mu_d","sigma_d","mu_logbeta","sigma_logbeta")))
+
+# Extract posterior draws for subject x context parameters
+post <- fit$draws(format = "df")  
+
+alpha_name <- "alpha[1,1]"
+summary_alpha11 <- fit$summary(alpha_name)
+print(summary_alpha11)
+
+draws_array <- fit$draws(format = "array") # iterations x chains x variables
+
+library(posterior)
+vars <- fit$metadata()$variable_names
+alpha_vars <- vars[grepl("^alpha\\[", vars)]
+alpha_summ <- fit$summary(alpha_vars, ~ quantile2(.x, probs = c(0.025, 0.5, 0.975)))
+print(alpha_summ)
+
+fit$save_object(file = "hier_rl_ctx_fit.rds")
+```
+
+Descriptive visualization of fits:
+```{r}
+plot_param_dist <- function(param_long, param_name, log_scale = FALSE) {
+  
+  param_long <- param_long %>%
+    mutate(value_plot = if(log_scale & param_name == "Beta (β)") log(value) else value)
+  
+  subj_mean <- param_long %>%
+    group_by(subject) %>%
+    summarise(mean_value = mean(value_plot))
+
+  group_mean <- mean(subj_mean$mean_value)
+  
+  ggplot() +
+    geom_density(data = param_long, aes(x = value_plot, group = subject),
+                 color = "grey50", alpha = 0.2) +
+    geom_vline(xintercept = group_mean, color = "dodgerblue", size = 1.5) +
+    labs(title = param_name,
+         x = ifelse(log_scale & param_name == "Beta (β)", "log(Value)", "Value"),
+         y = "Density") +
+    theme_minimal(base_size = 14)
+}
+
+alpha_plot <- plot_param_dist(alpha_long, "Alpha (α)")
+beta_plot  <- plot_param_dist(beta_long, "Beta (β)", log_scale = TRUE)
+decay_plot <- plot_param_dist(decay_long, "Decay")
+
+alpha_plot + beta_plot + decay_plot + plot_layout(ncol = 3)
+
+```
+
+
+Alpha Tests and plot
+```{r}
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(patchwork)
+
+# Prepare alpha data with Arousal labels
+alpha_arousal <- alpha_long %>%
+  filter(condition != "ctrl") %>%
+  mutate(
+    Arousal = case_when(
+      condition %in% c("HaHv", "HaLv") ~ "High",
+      condition %in% c("LaHv", "LaLv") ~ "Low"
+    )
+  )
+
+# Compute subject-level means per arousal
+subj_mean <- alpha_arousal %>%
+  group_by(subject, Arousal) %>%
+  summarise(mean_value = mean(value), .groups = "drop")
+
+# Compute group mean per arousal
+group_mean <- subj_mean %>%
+  group_by(Arousal) %>%
+  summarise(group_mean = mean(mean_value))
+
+# Plot
+ggplot() +
+  # Individual subject densities per arousal
+  geom_density(data = alpha_arousal, 
+               aes(x = value, group = interaction(subject,Arousal), color = Arousal),
+               alpha = 0.2) +
+  # Group mean vertical line per arousal
+  geom_vline(data = group_mean, aes(xintercept = group_mean, color = Arousal),
+             size = 1.5) +
+  scale_color_manual(values = c("High" = "dodgerblue", "Low" = "orange")) +
+  labs(title = "Alpha (α) Posterior Distributions by Arousal",
+       x = "Alpha (α)", y = "Density", color = "Arousal") +
+  theme_minimal(base_size = 14)
+
+alpha_subj_draws <- alpha_arousal %>%
+  group_by(subject, Arousal) %>%
+  summarise(alpha_mean = mean(value), .groups = "drop")
+
+# Group-level summaries (mean + 95% CI)
+group_summary <- alpha_subj_draws %>%
+  group_by(Arousal) %>%
+  summarise(
+    mean  = mean(alpha_mean),
+    lower = quantile(alpha_mean, 0.025),
+    upper = quantile(alpha_mean, 0.975),
+    .groups = "drop"
+  )
+
+group_summary <- group_summary %>%
+  mutate(y = ifelse(Arousal == "High", 0.04, 0.08))
+
+
+ggplot() +
+  # Individual subject densities
+  geom_density(
+    data = alpha_arousal,
+    aes(x = value, group = interaction(subject, Arousal), color = Arousal),
+    alpha = 0.2
+  ) +
+  
+  # Credible interval bars (at y = 0)
+  geom_segment(
+    data = group_summary,
+    aes(x = lower, xend = upper, y = y, yend = 0, color = Arousal),
+    size = 2
+  ) +
+  
+  # Group mean (vertical line)
+  geom_vline(
+    data = group_summary,
+    aes(xintercept = mean, color = Arousal),
+    size = 1.5
+  ) +
+  
+  scale_color_manual(values = c("High" = "dodgerblue", "Low" = "orange")) +
+  labs(
+    title = "Alpha (α) Posterior Distributions by Arousal",
+    x = "Alpha (α)",
+    y = "Density",
+    color = "Arousal"
+  ) +
+  theme_minimal(base_size = 14)
+
+```
+
+Alpha prep and plot
+```{r}
+draws_df <- as_draws_df(fit$draws())
+
+alpha_cols <- grep("^alpha\\[", colnames(draws_df), value = TRUE)
+alpha_draws <- draws_df %>% select(all_of(alpha_cols))
+
+# Pivot longer: iteration x var -> iteration x subject x context
+alpha_long <- alpha_draws %>%
+  pivot_longer(everything(), names_to = "param", values_to = "value") %>%
+  mutate(
+    # extract subject and context indices from name
+    subject = as.integer(sub("alpha\\[(\\d+),.*", "\\1", param)),
+    ctx     = as.integer(sub("alpha\\[\\d+,(\\d+)\\]", "\\1", param))
+  )
+
+alpha_long <- alpha_long %>%
+  mutate(condition = ((ctx - 1) %/% 2) + 1)  # integer division
+
+alpha_long <- alpha_long %>%
+  mutate(
+    condition = case_when(
+      condition == 1 ~ "ctrl",
+      condition == 2 ~ "HaHv",
+      condition == 3 ~ "HaLv",
+      condition == 4 ~ "LaHv",
+      condition == 5 ~ "LaLv"
+    )
+  )
+
+alpha_summary <- alpha_long %>%
+  group_by(condition) %>%
+  summarise(
+    mean = mean(value),
+    median = median(value),
+    lower = quantile(value, 0.025),
+    upper = quantile(value, 0.975)
+  )
+
+print(alpha_summary)
+
+ggplot(alpha_long, aes(x = factor(condition), y = value)) +
+  geom_violin(fill = "lightblue", alpha = 0.5) +
+  geom_boxplot(width = 0.1, outlier.shape = NA) +
+  ylab("Alpha (learning rate)") +
+  xlab("Condition") +
+  theme_minimal()
+```
+
+
+Beta prep and plot
+```{r}
+vars <- fit$metadata()$variable_names
+beta_vars <- vars[grepl("^beta\\[", vars)]
+beta_summ <- fit$summary(beta_vars, ~ quantile2(.x, probs = c(0.025, 0.5, 0.975)))
+print(beta_summ)
+
+beta_cols <- grep("^beta\\[", colnames(draws_df), value = TRUE)
+beta_draws <- draws_df %>% select(all_of(beta_cols))
+
+# Pivot longer: iteration x var -> iteration x subject x context
+beta_long <- beta_draws %>%
+  pivot_longer(everything(), names_to = "param", values_to = "value") %>%
+  mutate(
+    # extract subject and context indices from name
+    subject = as.integer(sub("beta\\[(\\d+),.*", "\\1", param)),
+    ctx     = as.integer(sub("beta\\[\\d+,(\\d+)\\]", "\\1", param))
+  )
+
+beta_long <- beta_long %>%
+  mutate(condition = ((ctx - 1) %/% 2) + 1)  # integer division
+
+beta_long <- beta_long %>%
+  mutate(
+    condition = case_when(
+      condition == 1 ~ "ctrl",
+      condition == 2 ~ "HaHv",
+      condition == 3 ~ "HaLv",
+      condition == 4 ~ "LaHv",
+      condition == 5 ~ "LaLv"
+    )
+  )
+
+beta_summary <- beta_long %>%
+  group_by(condition) %>%
+  summarise(
+    mean = mean(value),
+    median = median(value),
+    lower = quantile(value, 0.025),
+    upper = quantile(value, 0.975)
+  )
+
+print(beta_summary)
+
+ggplot(beta_long, aes(x = factor(condition), y = value)) +
+  geom_violin(fill = "lightblue", alpha = 0.5) +
+  geom_boxplot(width = 0.1, outlier.shape = NA) +
+  ylab("beta (learning rate)") +
+  xlab("Condition") +
+  theme_minimal()
+
+beta_long <- beta_long %>%
+  mutate(arousal = case_when(
+    condition %in% c("HaHv", "HaLv") ~ "High",
+    condition %in% c("LaHv", "LaLv") ~ "Low",
+    TRUE ~ NA_character_  # exclude ctrl if desired
+  )) %>%
+  filter(!is.na(arousal))  # remove ctrl
+
+beta_subject_arousal <- beta_long %>%
+  group_by(subject, arousal) %>%  # .draw comes from posterior package; if not, use iteration
+  summarise(beta_mean = mean(value), .groups = "drop")
+
+ggplot(beta_subject_arousal, aes(x = arousal, y = beta_mean)) +
+  geom_violin(fill = "lightblue", alpha = 0.5) +
+  geom_boxplot(width = 0.1, outlier.shape = NA) +
+  ylab("Beta (learning rate)") +
+  xlab("Arousal") +
+  theme_minimal()
+```
+
+
+Decay prep and plot
+```{r}
+decay_vars <- vars[grepl("^decay\\[", vars)]
+decay_summ <- fit$summary(decay_vars, ~ quantile2(.x, probs = c(0.025, 0.5, 0.975)))
+print(decay_summ)
+
+decay_cols <- grep("^decay\\[", colnames(draws_df), value = TRUE)
+decay_draws <- draws_df %>% select(all_of(decay_cols))
+
+# Pivot longer: iteration x var -> iteration x subject x context
+decay_long <- decay_draws %>%
+  pivot_longer(everything(), names_to = "param", values_to = "value") %>%
+  mutate(
+    # extract subject and context indices from name
+    subject = as.integer(sub("decay\\[(\\d+),.*", "\\1", param)),
+    ctx     = as.integer(sub("decay\\[\\d+,(\\d+)\\]", "\\1", param))
+  )
+
+decay_long <- decay_long %>%
+  mutate(condition = ((ctx - 1) %/% 2) + 1)  # integer division
+
+decay_long <- decay_long %>%
+  mutate(
+    condition = case_when(
+      condition == 1 ~ "ctrl",
+      condition == 2 ~ "HaHv",
+      condition == 3 ~ "HaLv",
+      condition == 4 ~ "LaHv",
+      condition == 5 ~ "LaLv"
+    )
+  )
+
+decay_summary <- decay_long %>%
+  group_by(condition) %>%
+  summarise(
+    mean = mean(value),
+    median = median(value),
+    lower = quantile(value, 0.025),
+    upper = quantile(value, 0.975)
+  )
+
+print(decay_summary)
+
+ggplot(decay_long, aes(x = factor(condition), y = value)) +
+  geom_violin(fill = "lightblue", alpha = 0.5) +
+  geom_boxplot(width = 0.1, outlier.shape = NA) +
+  ylab("decay (learning rate)") +
+  xlab("Condition") +
+  theme_minimal()
+
+decay_long <- decay_long %>%
+  mutate(arousal = case_when(
+    condition %in% c("HaHv", "HaLv") ~ "High",
+    condition %in% c("LaHv", "LaLv") ~ "Low",
+    TRUE ~ NA_character_  # exclude ctrl if desired
+  )) %>%
+  filter(!is.na(arousal))  # remove ctrl
+
+decay_subject_arousal <- decay_long %>%
+  group_by(subject, arousal) %>%  # .draw comes from posterior package; if not, use iteration
+  summarise(decay_mean = mean(value), .groups = "drop")
+
+ggplot(decay_subject_arousal, aes(x = arousal, y = decay_mean)) +
+  geom_violin(fill = "lightblue", alpha = 0.5) +
+  geom_boxplot(width = 0.1, outlier.shape = NA) +
+  ylab("decay (learning rate)") +
+  xlab("Arousal") +
+  theme_minimal()
+```
+
+Test for alpha difference with bridge sampling
+```{r}
+fit_alt <- brm(
+  alpha_mean ~ arousal + (1|subject),
+  data = alpha_subject_arousal,
+  save_pars = save_pars(all = TRUE),
+  chains = 4, iter = 2000
+)
+
+fit_null <- brm(
+  alpha_mean ~ 1 + (1|subject),
+  data = alpha_subject_arousal,
+  save_pars = save_pars(all = TRUE),
+  chains = 4, iter = 2000
+)
+
+bf <- bf(
+  bridge_sampler(fit_alt),
+  bridge_sampler(fit_null)
+)
+
+bf
+
+```
+
+
+Test for beta difference with bridge sampling
+```{r}
+fit_alt <- brm(
+  beta_mean ~ arousal + (1|subject),
+  data = beta_subject_arousal,
+  save_pars = save_pars(all = TRUE),
+  chains = 4, iter = 2000
+)
+
+fit_null <- brm(
+  beta_mean ~ 1 + (1|subject),
+  data = beta_subject_arousal,
+  save_pars = save_pars(all = TRUE),
+  chains = 4, iter = 2000
+)
+
+bf <- bf(
+  bridge_sampler(fit_alt),
+  bridge_sampler(fit_null)
+)
+
+bf
+```
+
+
+Test for decay difference with bridge sampling
+```{r}
+fit_alt <- brm(
+  decay_mean ~ arousal + (1|subject),
+  data = decay_subject_arousal,
+  save_pars = save_pars(all = TRUE),
+  chains = 4, iter = 2000
+)
+
+fit_null <- brm(
+  decay_mean ~ 1 + (1|subject),
+  data = decay_subject_arousal,
+  save_pars = save_pars(all = TRUE),
+  chains = 4, iter = 2000
+)
+
+bf <- bf(
+  bridge_sampler(fit_alt),
+  bridge_sampler(fit_null)
+)
+
+bf
+```

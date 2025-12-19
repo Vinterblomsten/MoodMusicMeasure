@@ -1,0 +1,450 @@
+---
+title: "Dataanalyse"
+output: html_document
+date: "2025-11-24"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(dplyr)
+library(tidyr)
+library(lmerTest)
+library(BayesFactor)
+library(bayestestR)
+library(ggplot2)
+library(scales)
+
+```
+
+Indlæs data, tjek at alle trials er der. Fix datatyper:
+```{r}
+datafiles = dir(".", pattern = 'results.csv', recursive = TRUE)
+datafiles
+
+d = read_delim(datafiles, id = 'File')
+
+#tjek at alle trials er der: 500*36=18000, og ændr tal til num
+data <- d%>%
+  filter(Blocktype != 'Practice') %>% 
+  mutate (
+    InductionMusicScore = as.numeric(InductionMusicScore),
+    PreMoodScore = as.numeric(PreMoodScore),
+    PostMoodScore = as.numeric(PostMoodScore)
+  )
+
+#tjek datatype:
+str(data)
+
+```
+Sorter efter eksklusionskriterier:
+```{r}
+ex_data <- data %>%
+  filter(!(FID %in% c('03T','105c','04T','203a','210a')))
+```
+
+Hurtigt plot for at se om score stiger
+```{r}
+data %>%
+  group_by(Trial)%>%
+  summarize(
+    meanScore = mean(Acummulated)
+  )%>%
+  ggplot(aes(
+    x = Trial,
+    y = meanScore,
+  )) + geom_point()
+```
+
+
+Dyk ned i switchrate
+
+```{r}
+
+switch_by_trial <- ex_data %>%
+  group_by(Block, Trial) %>%
+  summarise(
+    mean_switchrate = mean(Switch, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+ggplot(switch_by_trial, aes(x = Trial, y = mean_switchrate, color = factor(Block))) +
+  geom_line(linewidth = 1) +
+  labs(
+    x = "Trial",
+    y = "Switch rate",
+    color = "Block",
+    title = "Switching behavior over trials"
+  ) +
+  scale_color_manual(
+    values = c("Block 1" = "steelblue", "Block 2" = "darkorange"),
+    labels = c("Block 1 (75/55)", "Block 2 (60/50)")
+  ) +
+  theme_classic(base_size = 14) +
+  ylim(0, 1)
+
+
+
+#Bayesian t-test
+
+moodTestData %>%
+  filter(Block == 2, Arousal %in% c('H', 'L')) %>%
+  ttestBF(formula = SwitchRate ~ Arousal, data= .)
+
+
+
+# Switchdata plottet med lineært fit
+
+Switchdata <- ex_data %>%
+  filter(Trial == 50)%>%
+  group_by(FID)%>%
+  summarise(meanSwitchrate=mean(SwitchRate),
+            meanAcum=mean(Acummulated))
+
+ 
+  newdata <- tibble(
+  meanSwitchrate = seq(
+    min(Switchdata$meanSwitchrate, na.rm = TRUE),
+    max(Switchdata$meanSwitchrate, na.rm = TRUE),
+    length.out = 100
+  )
+)
+
+preds <- fitted(
+  fit,
+  newdata = newdata,
+  probs = c(0.025, 0.975)
+)
+
+bayes_df <- bind_cols(newdata, as.data.frame(preds))
+
+
+# Simple, polished theme
+theme_clean <- function(base_size = 14) {
+  theme_minimal(base_size = base_size) +
+    theme(
+      plot.title      = element_text(face = "bold", hjust = 0.5),
+      panel.grid.minor = element_blank(),
+      panel.grid.major.x = element_blank()
+    )
+}
+
+plotAS <- ggplot() +
+  # 95% credible ribbon
+  geom_ribbon(
+    data = bayes_df,
+    aes(x = meanSwitchrate, ymin = Q2.5, ymax = Q97.5),
+    fill = "#CFE7FF",   # light blue
+    alpha = 0.6
+  ) +
+  # Posterior mean line
+  geom_line(
+    data = bayes_df,
+    aes(x = meanSwitchrate, y = Estimate),
+    linewidth = 1.1,
+    color = "#1F77B4"   # darker blue
+  ) +
+  # Raw data points
+  geom_point(
+    data = Switchdata,
+    aes(x = meanSwitchrate, y = meanAcum),
+    size = 2.8,
+    alpha = 0.8,
+    color = "#FF7F0E"   # orange
+  ) +
+  labs(
+    title = "Effect of Switching on Accumulated Score",
+    x     = "Mean switch rate",
+    y     = "Mean accumulated score"
+  ) +
+  theme_clean()
+
+plotAS
+
+
+
+fit <- brm(
+  meanAcum ~ meanSwitchrate,
+  data = Switchdata,
+  chains = 4, iter = 4000, warmup = 1000
+)
+
+summary(fit)
+
+#bayesia alternative:
+bf_model <- regressionBF(meanAcum ~ meanSwitchrate, data = Switchdata)
+bf_model
+
+# mood og switchrate
+Mooddata <- ex_data %>% 
+  filter(Trial == 50)%>%
+  group_by(FID)%>%
+  summarise(meanSwitchrate=mean(SwitchRate),
+            meanMood=mean(PreMoodScore))
+Mooddata %>%
+  ggplot(aes(x = meanMood, y = meanSwitchrate)) + geom_point()
+  
+
+
+model_switch_mood <- regressionBF(meanSwitchrate ~ meanMood , data = Mooddata)
+model_switch_mood
+
+```
+Påvirker ens humør den akkumuleret score?
+```{r}
+Mood_acum_data <- ex_data %>% 
+  filter(Trial == 50)%>%
+  group_by(FID)%>%
+  summarise(meanAcum=mean(Acummulated),
+            meanMood=mean(PreMoodScore))
+mood_model <- lmer(meanMood ~ meanAcum, data = Mood_acum_data) #Lav denne om til BRM
+summary(mood_model)
+```
+
+
+Skifter man retning når man taber?
+```{r}
+stay_data <- moodTestData %>%
+  arrange(FID, Blocktype, Block, Trial) %>%
+  group_by(FID, Blocktype, Arousal) %>%
+  mutate(next_switch = lead(Switch)) %>%
+  ungroup() %>%
+  filter(next_switch == 0)
+
+lossaversion_data <- moodTestData %>%
+  arrange(FID, Blocktype, Block, Trial) %>%
+  group_by(FID, Blocktype, Arousal) %>%
+  mutate(next_switch = lead(Switch)) %>%
+  ungroup() %>%
+  filter(next_switch == 1)
+
+loss_aversion_subject <- moodTestData %>%
+  arrange(FID, Blocktype, Block, Trial) %>%
+  group_by(FID, Arousal) %>%
+  mutate(next_switch = lead(Switch)) %>%
+  summarise(
+    reward_before_switch = mean(Reward[next_switch == 1], na.rm = TRUE),
+    reward_before_stay   = mean(Reward[next_switch == 0], na.rm = TRUE),
+    loss_aversion = reward_before_switch - reward_before_stay,
+    .groups = "drop"
+  )
+
+wideL <- loss_aversion_subject %>%
+  select(FID, Arousal, loss_aversion) %>%
+  tidyr::pivot_wider(names_from = Arousal, values_from = loss_aversion) %>%
+  filter(is.finite(H), is.finite(L))
+
+ttestBF(x = wideL$H, y = wideL$L, paired = TRUE)
+
+mean_lossaversion_reward <- mean(lossaversion_data$Reward)
+mean_reward <- mean(ex_data$Reward)
+
+ttestBF(
+  loss_aversion_subject %>% filter(Arousal == "H") %>% pull(reward_before_stay),
+  loss_aversion_subject %>% filter(Arousal == "L") %>% pull(reward_before_stay),
+  paired = TRUE
+  )
+
+ttestBF(lossaversion_data$Reward, stay_data$Reward)
+
+
+
+
+# Combine and summarise
+reward_summary <- bind_rows(
+  stay_data %>% mutate(Condition = "Stay"),
+  lossaversion_data %>% mutate(Condition = "Switch")
+) %>%
+  group_by(Condition) %>%
+  summarise(
+    mean_reward = mean(Reward, na.rm = TRUE),
+    sd_reward   = sd(Reward, na.rm = TRUE),
+    n           = n(),
+    se_reward   = sd_reward / sqrt(n),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    Condition = factor(Condition, levels = c("Stay", "Switch"))
+  )
+
+# Plot
+plot_reward <- ggplot(reward_summary, aes(x = Condition, y = mean_reward)) +
+  geom_col(width = 0.6, fill = "#1F77B4", alpha = 0.9) +
+  geom_errorbar(
+    aes(ymin = mean_reward - se_reward, ymax = mean_reward + se_reward),
+    width = 0.15,
+    linewidth = 0.8
+  ) +
+  labs(
+    title = "Mean reward before stay vs switch",
+    x = "Next action",
+    y = "Mean reward"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    panel.grid.minor = element_blank()
+  )
+
+plot_reward
+
+
+```
+
+Loss aversion for each blocktype
+```{r}
+lossaversion_data_lalv <- ex_data %>%
+  filter(Blocktype == 'LaLv') %>%
+  arrange(FID, Blocktype, Block, Trial) %>%
+  group_by(FID) %>%
+  mutate(next_switch = lead(Switch)) %>%
+  ungroup() %>%
+  filter(next_switch == 1)
+
+lossaversion_data_Hahv <- ex_data %>%
+  filter(Blocktype == 'HaHv') %>%
+  arrange(FID, Blocktype, Block, Trial) %>%
+  group_by(FID) %>%
+  mutate(next_switch = lead(Switch)) %>%
+  ungroup() %>%
+  filter(next_switch == 1)
+
+moodTestData <- ex_data %>%
+  extract(Blocktype,
+          into = c("Arousal", "Valence"),
+          regex = "(H|L)a(H|L)v",
+          remove = FALSE) 
+
+HLmoodTestData <- moodTestData %>%
+  filter(Arousal=='L') %>%
+  arrange(FID, Blocktype, Block, Trial) %>%
+  group_by(FID) %>%
+  mutate(next_switch = lead(Switch)) %>%
+  ungroup() %>%
+  filter(next_switch == 1)
+
+HAmoodTestData <- moodTestData %>%
+  filter(Arousal=='H') %>%
+  arrange(FID, Blocktype, Block, Trial) %>%
+  group_by(FID) %>%
+  mutate(next_switch = lead(Switch)) %>%
+  ungroup() %>%
+  filter(next_switch == 1)
+
+
+ttestBF(HAmoodTestData$Reward, HLmoodTestData$Reward)
+
+```
+```{r}
+
+ttc_one <- function(df, best_arm, k = 10, thr = 8) {
+  df <- df %>% arrange(Trial)
+
+  if (nrow(df) < k) return(NA_integer_)
+
+  df <- df %>%
+    mutate(
+      is_best = as.integer(Arm == best_arm),
+      win_sum = rollapply(is_best, width = k, FUN = sum, fill = NA, align = "right"),
+      pass    = !is.na(win_sum) & (win_sum >= thr)
+    )
+
+  idx <- which(df$pass)[1]
+  if (is.na(idx)) return(NA_integer_)
+
+  df$Trial[idx]
+}
+
+compute_learning_optionA <- function(dat, k = 10) {
+
+  # Fix column names if read.csv() converted Arm-A -> Arm.A etc.
+  if (!("Arm-A" %in% names(dat)) && ("Arm.A" %in% names(dat))) dat <- dat %>% rename(`Arm-A` = Arm.A)
+  if (!("Arm-B" %in% names(dat)) && ("Arm.B" %in% names(dat))) dat <- dat %>% rename(`Arm-B` = Arm.B)
+
+  dat <- dat %>%
+    mutate(
+      thr = case_when(
+        Block == 1 ~ 8L,  # 75/55
+        Block == 2 ~ 8L,  # 60/50 (change to 7L if you want it easier)
+        TRUE ~ 8L
+      )
+    )
+
+  dat %>%
+    group_by(FID, Blocktype, Block) %>%
+    group_modify(~{
+      d <- .x %>% arrange(Trial)
+
+      # determine best arm from true probabilities
+      pA <- d$`Arm-A`[1]
+      pB <- d$`Arm-B`[1]
+      best_arm <- ifelse(pA > pB, "A", ifelse(pB > pA, "B", NA_character_))
+
+      if (is.na(best_arm)) {
+        return(tibble(
+          best_arm = NA_character_,
+          threshold = d$thr[1],
+          window = k,
+          trials_to_criterion = NA_integer_,
+          learned_by_50 = FALSE
+        ))
+      }
+
+      ttc <- ttc_one(d, best_arm = best_arm, k = k, thr = d$thr[1])
+
+      tibble(
+        best_arm = best_arm,
+        threshold = d$thr[1],
+        window = k,
+        trials_to_criterion = ttc,
+        learned_by_50 = !is.na(ttc)
+      )
+    }) %>%
+    ungroup()
+}
+
+# Run it:
+learnA <- compute_learning_optionA(ex_data, k = 10)
+
+
+```
+
+```{r}
+sum(learnA$learned_by_50 == 'FALSE')
+sum(learnA$learned_by_50 == 'TRUE')
+
+sum(learnA$Block == 1 & !learnA$learned_by_50, na.rm = TRUE)
+sum(learnA$Block == 2 & !learnA$learned_by_50, na.rm = TRUE)
+
+learnA %>%
+  filter(learned_by_50) %>%
+  group_by(Block) %>%
+  summarise(
+    mean_threshold = mean(trials_to_criterion, na.rm = TRUE),
+    sd_threshold   = sd(trials_to_criterion, na.rm = TRUE),
+    n_learners     = n()
+  )
+
+learnA %>%
+  filter(learned_by_50) %>%
+  group_by(Blocktype, Block) %>%
+  summarise(
+    mean_threshold = mean(trials_to_criterion),
+    sd_threshold   = sd(trials_to_criterion),
+    n_learners     = n(),
+    .groups = "drop"
+  )
+
+learnA %>%
+  mutate(
+    ttc_censored = ifelse(is.na(trials_to_criterion), 50, trials_to_criterion)
+  ) %>%
+  group_by(Block) %>%
+  summarise(
+    mean_threshold = mean(ttc_censored),
+    sd_threshold   = sd(ttc_censored),
+    n_blocks       = n(),
+    .groups = "drop"
+  )
+
+
